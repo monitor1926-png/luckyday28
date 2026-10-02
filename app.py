@@ -94,3 +94,413 @@ def split_text(text, limit=3900):
     """Telegram limits are measured conservatively in UTF-16 code units."""
     out, buf, units = [], [], 0
     for c in text:
+        n = 2 if ord(c) > 0xffff else 1
+        if units + n > limit:
+            out.append(''.join(buf)); buf, units = [], 0
+        buf.append(c); units += n
+    if buf:
+        out.append(''.join(buf))
+    return out
+
+
+def validate_result(r):
+    if set(r) != {'action', 'target', 'translation', 'clarification'}:
+        raise ValueError('invalid result fields')
+    if r['action'] not in {'translate', 'clarify', 'skip'} or r['target'] not in {'zh', 'vi', 'unknown'}:
+        raise ValueError('invalid result enum')
+    if not isinstance(r['translation'], str) or not isinstance(r['clarification'], str):
+        raise ValueError('invalid result types')
+    if r['action'] == 'translate' and (r['target'] == 'unknown' or not r['translation'].strip()):
+        raise ValueError('empty translation')
+    if r['action'] == 'clarify' and not r['clarification'].strip():
+        raise ValueError('missing clarification')
+    return r
+
+
+def render(r):
+    if r['action'] == 'skip':
+        return ''
+    text = r['translation'].strip()
+    if text:
+        text = ('🇨🇳 ' if r['target'] == 'zh' else '🇻🇳 ' if r['target'] == 'vi' else '') + text
+    if r['action'] == 'clarify':
+        text += ('\n\n' if text else '') + '⚠️ ' + r['clarification'].strip()
+    return text
+
+
+class Store:
+    def __init__(self, path):
+        self.path = path
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as db:
+            db.executescript('''
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS jobs (
+                update_id INTEGER PRIMARY KEY, chat_id INTEGER, message_id INTEGER,
+                thread_id INTEGER, event_time REAL, payload TEXT, state TEXT DEFAULT 'pending',
+                attempts INTEGER DEFAULT 0, due REAL DEFAULT 0, result TEXT,
+                error TEXT DEFAULT '', created REAL);
+            CREATE INDEX IF NOT EXISTS jobs_scope ON jobs(chat_id,thread_id,update_id);
+            CREATE TABLE IF NOT EXISTS delivery_progress (
+                update_id INTEGER, part INTEGER, PRIMARY KEY(update_id,part));
+            CREATE TABLE IF NOT EXISTS deliveries (
+                chat_id INTEGER, message_id INTEGER, part INTEGER, bot_message_id INTEGER,
+                PRIMARY KEY(chat_id,message_id,part));
+            ''')
+
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=15)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def enqueue(self, update_id, m):
+        chat_id = m['chat']['id']; mid = m['message_id']
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM jobs WHERE update_id=?', (update_id,)).fetchone():
+                return False
+            # Out-of-order old updates must not revert a newer edited message.
+            newer = db.execute('SELECT 1 FROM jobs WHERE chat_id=? AND message_id=? AND update_id>?',
+                               (chat_id, mid, update_id)).fetchone()
+            db.execute('UPDATE jobs SET state=? WHERE chat_id=? AND message_id=? AND update_id<? AND state IN (?,?)',
+                       ('superseded', chat_id, mid, update_id, 'pending', 'failed'))
+            db.execute('INSERT INTO jobs(update_id,chat_id,message_id,thread_id,event_time,payload,state,created) VALUES(?,?,?,?,?,?,?,?)',
+                       (update_id, chat_id, mid, m.get('message_thread_id', 0),
+                        m.get('edit_date', m.get('date', time.time())), json.dumps(m, ensure_ascii=False),
+                        'superseded' if newer else 'pending', time.time()))
+            return True
+
+    def claim(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            # Preserve ordering within each group/topic while a transient failure is waiting.
+            row = db.execute('''SELECT j.* FROM jobs j WHERE j.state='pending' AND j.due<=?
+                AND NOT EXISTS(SELECT 1 FROM jobs p WHERE p.chat_id=j.chat_id AND p.thread_id=j.thread_id
+                AND p.update_id<j.update_id AND p.state IN ('pending','processing','sending'))
+                ORDER BY j.update_id LIMIT 1''', (time.time(),)).fetchone()
+            if row is None:
+                return None
+            db.execute("UPDATE jobs SET state='processing', attempts=attempts+1 WHERE update_id=?", (row['update_id'],))
+            return dict(db.execute('SELECT * FROM jobs WHERE update_id=?', (row['update_id'],)).fetchone())
+
+    def recover(self):
+        # Called only while holding the single-worker OS lock.
+        with self.connect() as db:
+            db.execute("UPDATE jobs SET state='pending' WHERE state='processing'")
+            db.execute("UPDATE jobs SET state='uncertain',error='restart_during_delivery' WHERE state='sending'")
+
+    def finish(self, uid, state='done', error=''):
+        with self.connect() as db:
+            db.execute('UPDATE jobs SET state=?,error=? WHERE update_id=?', (state, error, uid))
+
+    def mark_sending(self, uid):
+        self.finish(uid, 'sending')
+
+    def save_result(self, uid, result):
+        with self.connect() as db:
+            db.execute('UPDATE jobs SET result=? WHERE update_id=?', (json.dumps(result, ensure_ascii=False), uid))
+
+    def retry(self, uid, error, delay=5):
+        with self.connect() as db:
+            db.execute("UPDATE jobs SET state='pending',error=?,due=? WHERE update_id=?", (error, time.time()+delay, uid))
+
+    def deliveries(self, chat_id, mid):
+        with self.connect() as db:
+            return [x[0] for x in db.execute('SELECT bot_message_id FROM deliveries WHERE chat_id=? AND message_id=? ORDER BY part', (chat_id, mid))]
+
+    def save_delivery(self, chat_id, mid, part, bot_mid):
+        with self.connect() as db:
+            db.execute('INSERT OR REPLACE INTO deliveries VALUES(?,?,?,?)', (chat_id, mid, part, bot_mid))
+
+    def completed_parts(self, uid):
+        with self.connect() as db:
+            return {x[0] for x in db.execute('SELECT part FROM delivery_progress WHERE update_id=?',(uid,))}
+
+    def complete_part(self, uid, part):
+        with self.connect() as db:
+            db.execute('INSERT OR IGNORE INTO delivery_progress VALUES(?,?)',(uid,part))
+            db.execute("UPDATE jobs SET state='processing' WHERE update_id=?",(uid,))
+
+    def is_latest(self, job):
+        with self.connect() as db:
+            return not db.execute('SELECT 1 FROM jobs WHERE chat_id=? AND message_id=? AND update_id>?',
+                                  (job['chat_id'],job['message_id'],job['update_id'])).fetchone()
+
+    def context(self, m, uid, ttl=900, limit=6):
+        now = m.get('edit_date', m.get('date', time.time()))
+        with self.connect() as db:
+            rows = db.execute('''SELECT payload FROM jobs j WHERE chat_id=? AND thread_id=? AND update_id<?
+                AND message_id<>? AND event_time>=? AND event_time<=? AND state<>'superseded'
+                AND NOT EXISTS(SELECT 1 FROM jobs newer WHERE newer.chat_id=j.chat_id
+                    AND newer.message_id=j.message_id AND newer.update_id>j.update_id AND newer.update_id<?)
+                ORDER BY update_id DESC LIMIT ?''',
+                (m['chat']['id'],m.get('message_thread_id',0),uid,m['message_id'],now-ttl,now,uid,limit)).fetchall()
+        return [context_item(json.loads(x[0])) for x in reversed(rows)]
+
+    def status(self):
+        with self.connect() as db:
+            return [dict(x) for x in db.execute('SELECT update_id,chat_id,message_id,state,attempts,error FROM jobs ORDER BY update_id')]
+
+    def prune(self, days=7):
+        cutoff = time.time() - days*86400
+        with self.connect() as db:
+            # Keep compact source-to-bot IDs for future edits; expire original text separately.
+            db.execute("DELETE FROM delivery_progress WHERE update_id IN (SELECT update_id FROM jobs WHERE created<? AND state IN ('done','superseded'))", (cutoff,))
+            db.execute("DELETE FROM jobs WHERE created<? AND state IN ('done','superseded')", (cutoff,))
+
+
+def context_item(m):
+    return {'message_id': m.get('message_id'), 'sender_id': m.get('from',{}).get('id'),
+            'text': get_text(m)[:4096]}
+
+
+def config():
+    return {'token': os.getenv('TELEGRAM_BOT_TOKEN',''), 'key': os.getenv('OPENAI_API_KEY',''),
+            'secret': os.getenv('TELEGRAM_WEBHOOK_SECRET',''),
+            'allowed': {int(x.strip()) for x in os.getenv('ALLOWED_CHAT_IDS','').split(',') if x.strip()},
+            'db': os.getenv('DATABASE_PATH','data/translator.sqlite3'),
+            'model': os.getenv('OPENAI_MODEL','gpt-4o-mini'),
+            'context_ttl': int(os.getenv('CONTEXT_TTL_SECONDS','900')),
+            'retention': int(os.getenv('RETENTION_DAYS','7')),
+            'glossary': os.getenv('GLOSSARY_PATH','glossary.json')}
+
+
+def create_app(cfg=None, store=None):
+    from flask import Flask, request
+    cfg = cfg or config()
+    if not cfg['secret'] or not cfg['allowed']:
+        raise ValueError('必须设置 TELEGRAM_WEBHOOK_SECRET 和 ALLOWED_CHAT_IDS')
+    store = store or Store(cfg['db'])
+    app = Flask(__name__)
+    app.config['MAX_CONTENT_LENGTH'] = 512 * 1024
+
+    @app.get('/')
+    def health():
+        return {'service': 'translator-webhook', 'status':'ok'}
+
+    @app.post('/webhook')
+    def webhook():
+        supplied = request.headers.get('X-Telegram-Bot-Api-Secret-Token','')
+        if not hmac.compare_digest(supplied, cfg['secret']):
+            return 'unauthorized', 403
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or not isinstance(data.get('update_id'), int):
+            return 'invalid update', 400
+        m = data.get('message') or data.get('edited_message')
+        if not isinstance(m, dict) or m.get('chat',{}).get('id') not in cfg['allowed']:
+            return 'ok'
+        if not isinstance(m.get('message_id'), int):
+            return 'invalid message', 400
+        # Edits to emoji/command/link must still retract old translations.
+        if should_skip(m) and 'edited_message' not in data:
+            return 'ok'
+        try:
+            store.enqueue(data['update_id'], m)
+        except sqlite3.Error:
+            LOG.error('queue_write_failed')
+            return 'queue unavailable', 503
+        return 'ok'
+    return app
+
+
+class Translator:
+    def __init__(self, cfg):
+        from openai import OpenAI
+        self.client = OpenAI(api_key=cfg['key'], timeout=60, max_retries=0)
+        self.cfg = cfg
+        path = Path(cfg['glossary'])
+        self.glossary = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+
+    def translate(self, m, recent):
+        from openai import APIConnectionError, APIStatusError
+        reply = m.get('reply_to_message')
+        if reply and reply.get('from',{}).get('is_bot'):
+            reply = None  # A model-generated translation is not original-source context.
+        payload = {'current': context_item(m), 'reply':context_item(reply) if reply else None,
+                   'recent':recent, 'glossary':self.glossary}
+        try:
+            response = self.client.responses.create(
+                model=self.cfg['model'], store=False, max_output_tokens=7000,
+                input=[{'role':'system','content':SYSTEM_PROMPT},
+                       {'role':'user','content':json.dumps(payload, ensure_ascii=False)}],
+                text={'format':{'type':'json_schema','name':'translation_result','strict':True,'schema':SCHEMA}})
+        except APIConnectionError:
+            raise Retryable('openai_connection') from None
+        except APIStatusError as e:
+            if e.status_code in {408,409,429} or e.status_code >= 500:
+                raise Retryable('openai_' + str(e.status_code)) from None
+            raise Permanent('openai_' + str(e.status_code)) from None
+        if response.status != 'completed' or not response.output_text:
+            raise Retryable('openai_incomplete_or_refusal')
+        try:
+            return validate_result(json.loads(response.output_text))
+        except (ValueError, TypeError):
+            raise Retryable('invalid_model_output') from None
+
+
+def check_telegram(status, body, editing=False):
+    if body.get('ok') is True:
+        return body['result']
+    code = body.get('error_code', status)
+    description = body.get('description','')
+    if editing and code == 400 and 'message is not modified' in description.lower():
+        return True
+    if editing and code == 400 and 'message to edit not found' in description.lower():
+        raise MissingEdit('telegram_edit_message_missing')
+    if code == 429:
+        raise Retryable('telegram_429', max(1, int(body.get('parameters',{}).get('retry_after',5))))
+    if status >= 500 or code >= 500:
+        raise Uncertain('telegram_server_delivery_unknown')
+    raise Permanent('telegram_' + str(code))
+
+
+class Telegram:
+    def __init__(self, token):
+        import requests
+        self.session = requests.Session()
+        self.base = 'https://api.telegram.org/bot' + token
+
+    def call(self, method, payload):
+        import requests
+        try:
+            response = self.session.post(self.base+'/'+method, json=payload, timeout=(5,20))
+        except requests.ConnectTimeout:
+            raise Retryable('telegram_connect_timeout') from None
+        except requests.RequestException:
+            # Never expose the exception URL, which contains the bot token.
+            raise Uncertain('telegram_network_delivery_unknown') from None
+        try:
+            body = response.json()
+        except ValueError:
+            raise Uncertain('telegram_invalid_response') from None
+        return check_telegram(response.status_code, body, method=='editMessageText')
+
+
+def deliver(store, tg, job, m, result):
+    text = render(result)
+    old = store.deliveries(job['chat_id'], job['message_id'])
+    if not text and not old:
+        return
+    parts = split_text(text) if text else []
+    # Existing extra parts are edited to a neutral withdrawal notice; don't leave stale facts.
+    size = max(len(parts), len(old))
+    completed = store.completed_parts(job['update_id'])
+    for i in range(size):
+        if i in completed:
+            continue
+        if not store.is_latest(job):
+            return  # A newer edit will replace all known delivered parts.
+        body = parts[i] if i < len(parts) else '原文已修改，此段译文已撤回。\nTin gốc đã sửa, bản dịch phần này đã được rút lại.'
+        store.mark_sending(job['update_id'])
+        payload = {'chat_id':job['chat_id'], 'text':body, 'link_preview_options':{'is_disabled':True}}
+        needs_send = i >= len(old)
+        if not needs_send:
+            payload['message_id'] = old[i]
+            try:
+                tg.call('editMessageText', payload)
+            except MissingEdit:
+                needs_send = True
+                del payload['message_id']
+        if needs_send:
+            payload['reply_parameters'] = {'message_id':job['message_id'],'allow_sending_without_reply':True}
+            if m.get('message_thread_id'):
+                payload['message_thread_id'] = m['message_thread_id']
+            sent = tg.call('sendMessage', payload)
+            store.save_delivery(job['chat_id'],job['message_id'],i,sent['message_id'])
+        # Progress prevents retries replaying confirmed earlier parts of this same update.
+        store.complete_part(job['update_id'],i)
+        time.sleep(1.1)  # Paces group sends; never drops user messages.
+
+
+def process_one(store, translator, tg, cfg):
+    job = store.claim()
+    if job is None:
+        return False
+    uid = job['update_id']; m = json.loads(job['payload'])
+    try:
+        if not store.is_latest(job):
+            store.finish(uid,'superseded'); return True
+        if should_skip(m):
+            result = {'action':'skip','target':'unknown','translation':'','clarification':''}
+        elif job['result']:
+            result = validate_result(json.loads(job['result']))
+        else:
+            result = translator.translate(m, store.context(m,uid,ttl=cfg['context_ttl']))
+            store.save_result(uid,result)
+        deliver(store,tg,job,m,result)
+        store.finish(uid, 'done' if store.is_latest(job) else 'superseded')
+    except Retryable as e:
+        if job['attempts'] >= 5:
+            store.finish(uid,'failed',str(e))
+        else:
+            store.retry(uid,str(e),max(e.delay,min(60,2**job['attempts'])))
+        LOG.warning('job=%s retryable=%s',uid,str(e))
+    except Uncertain as e:
+        store.finish(uid,'uncertain',str(e))
+        LOG.error('job=%s delivery_uncertain; inspect status',uid)
+    except Permanent as e:
+        store.finish(uid,'failed',str(e))
+        LOG.error('job=%s permanent=%s',uid,str(e))
+    except Exception as e:
+        # An unexpected exception during a send must not silently duplicate delivery.
+        states = {x['update_id']:x['state'] for x in store.status()}
+        store.finish(uid,'uncertain' if states.get(uid)=='sending' else 'failed',type(e).__name__)
+        LOG.error('job=%s unexpected=%s',uid,type(e).__name__)
+    return True
+
+
+def worker(cfg):
+    import fcntl
+    store = Store(cfg['db'])
+    # One worker per persistent DB; prevents startup recovery racing an active worker.
+    with open(cfg['db']+'.worker.lock','a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit('该数据库已有 worker。只运行一个 worker。')
+        if not cfg['token'] or not cfg['key']:
+            raise SystemExit('必须设置 TELEGRAM_BOT_TOKEN 和 OPENAI_API_KEY')
+        translator = Translator(cfg); tg = Telegram(cfg['token'])
+        store.recover(); last_prune = 0
+        while True:
+            if time.time()-last_prune > 3600:
+                store.prune(cfg['retention']); last_prune = time.time()
+            if not process_one(store,translator,tg,cfg):
+                time.sleep(0.5)
+
+
+def main():
+    from dotenv import load_dotenv
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
+    # HTTP client logs may contain token-bearing URLs, so suppress them.
+    logging.getLogger('httpx').setLevel(logging.CRITICAL)
+    logging.getLogger('httpcore').setLevel(logging.CRITICAL)
+    p = argparse.ArgumentParser()
+    p.add_argument('command', choices=['web','worker','set-webhook','status','retry'])
+    p.add_argument('--update-id',type=int)
+    args = p.parse_args(); cfg = config()
+    if args.command == 'web':
+        create_app(cfg).run(host='0.0.0.0',port=int(os.getenv('PORT','8080')),debug=False)
+    elif args.command == 'worker':
+        worker(cfg)
+    elif args.command == 'set-webhook':
+        url = os.getenv('WEBHOOK_URL','')
+        if not url.startswith('https://') or not cfg['token'] or not cfg['secret']:
+            raise SystemExit('设置 HTTPS WEBHOOK_URL、bot token 和 webhook secret')
+        Telegram(cfg['token']).call('setWebhook',{'url':url,'secret_token':cfg['secret'],
+                    'allowed_updates':['message','edited_message'],'max_connections':1})
+        print('Webhook 已设置')
+    elif args.command == 'status':
+        print(json.dumps(Store(cfg['db']).status(),ensure_ascii=False,indent=2))
+    elif args.command == 'retry':
+        store = Store(cfg['db']); row = next((x for x in store.status() if x['update_id']==args.update_id),None)
+        if not row or row['state'] != 'failed':
+            raise SystemExit('仅允许重试 failed；uncertain 必须先核查 Telegram，避免重复发送')
+        with store.connect() as db:
+            db.execute("UPDATE jobs SET state='pending',attempts=0,due=0,error='' WHERE update_id=?",(args.update_id,))
+        print('已重新排队')
+
+
+if __name__ == '__main__':
+    main()
