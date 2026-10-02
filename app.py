@@ -1,5 +1,7 @@
 """中越群翻译。Webhook 只入持久队列，单独的单进程 worker 消费。"""
 import argparse
+import atexit
+import threading
 import hmac
 import json
 import logging
@@ -10,6 +12,8 @@ import time
 from pathlib import Path
 
 LOG = logging.getLogger('translator')
+logging.getLogger('httpx').setLevel(logging.CRITICAL)
+logging.getLogger('httpcore').setLevel(logging.CRITICAL)
 URL = re.compile(r'(?:https?://|www\.|t\.me/|telegram\.me/)\S+', re.I)
 
 SYSTEM_PROMPT = '''你是 Telegram 群的中文—越南语翻译员，服务日常和工作沟通。
@@ -265,29 +269,56 @@ def config():
             'glossary': os.getenv('GLOSSARY_PATH','glossary.json')}
 
 
-def create_app(cfg=None, store=None):
+def create_app(cfg=None, store=None, auto_worker=True):
     from flask import Flask, request
     cfg = cfg or config()
-    if not cfg['secret'] or not cfg['allowed']:
-        raise ValueError('必须设置 TELEGRAM_WEBHOOK_SECRET 和 ALLOWED_CHAT_IDS')
     store = store or Store(cfg['db'])
     app = Flask(__name__)
     app.config['MAX_CONTENT_LENGTH'] = 512 * 1024
+    runtime = {'thread':None, 'stop':threading.Event(), 'lock':threading.Lock(), 'error':None, 'ready':threading.Event()}
+    app.extensions['translator_runtime'] = runtime
+
+    def run_background():
+        try:
+            worker(cfg, stop_event=runtime['stop'], ready_event=runtime['ready'])
+        except BaseException as exc:
+            runtime['error'] = type(exc).__name__
+            LOG.error('background_worker_stopped=%s',type(exc).__name__)
+
+    @app.before_request
+    def ensure_background_worker():
+        # Start after Gunicorn forks, on its first healthcheck or webhook request.
+        # No separate process/service or extra user configuration is needed.
+        if not auto_worker:
+            return None
+        if not cfg.get('token') or not cfg.get('key'):
+            return {'status':'error','message':'请设置 TELEGRAM_BOT_TOKEN 和 OPENAI_API_KEY'},503
+        with runtime['lock']:
+            if runtime['thread'] is None:
+                runtime['thread'] = threading.Thread(target=run_background,name='translator-worker',daemon=True)
+                runtime['thread'].start()
+                atexit.register(runtime['stop'].set)
+            elif not runtime['thread'].is_alive():
+                return {'status':'error','message':'翻译处理已停止，请查看部署日志并重启'},503
+        return None
 
     @app.get('/')
     def health():
-        return {'service': 'translator-webhook', 'status':'ok'}
+        return {'service':'translator-webhook','status':'ok' if not auto_worker or runtime['ready'].is_set() else 'starting',
+                'translation_worker_ready':runtime['ready'].is_set()}
 
     @app.post('/webhook')
     def webhook():
         supplied = request.headers.get('X-Telegram-Bot-Api-Secret-Token','')
-        if not hmac.compare_digest(supplied, cfg['secret']):
+        if cfg['secret'] and not hmac.compare_digest(supplied, cfg['secret']):
             return 'unauthorized', 403
         data = request.get_json(silent=True)
         if not isinstance(data, dict) or not isinstance(data.get('update_id'), int):
             return 'invalid update', 400
         m = data.get('message') or data.get('edited_message')
-        if not isinstance(m, dict) or m.get('chat',{}).get('id') not in cfg['allowed']:
+        if not isinstance(m, dict) or m.get('chat',{}).get('type') not in {'group','supergroup'}:
+            return 'ok'
+        if cfg['allowed'] and m.get('chat',{}).get('id') not in cfg['allowed']:
             return 'ok'
         if not isinstance(m.get('message_id'), int):
             return 'invalid message', 400
@@ -309,7 +340,11 @@ class Translator:
         self.client = OpenAI(api_key=cfg['key'], timeout=60, max_retries=0)
         self.cfg = cfg
         path = Path(cfg['glossary'])
-        self.glossary = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+        self.glossary = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {
+            'Springuu':'品牌名称保持不变',
+            '奥黛骑行':'穿奥黛的越南女向导驾驶女式摩托车，客人坐后座，客人无需穿奥黛。不能理解成客人自己骑车。',
+            '定金':'预约语境中的 tiền đặt cọc，不能混淆成已付全款'
+        }
 
     def translate(self, m, recent):
         from openai import APIConnectionError, APIStatusError
@@ -449,35 +484,46 @@ def process_one(store, translator, tg, cfg):
     return True
 
 
-def worker(cfg):
+def worker(cfg, stop_event=None, ready_event=None):
     import fcntl
+    stop_event = stop_event or threading.Event()
     store = Store(cfg['db'])
     # One worker per persistent DB; prevents startup recovery racing an active worker.
     with open(cfg['db']+'.worker.lock','a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit('该数据库已有 worker。只运行一个 worker。')
+        while not stop_event.is_set():
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                # Graceful Gunicorn reload can overlap retiring and new processes.
+                stop_event.wait(0.2)
+        if stop_event.is_set():
+            return
         if not cfg['token'] or not cfg['key']:
             raise SystemExit('必须设置 TELEGRAM_BOT_TOKEN 和 OPENAI_API_KEY')
         translator = Translator(cfg); tg = Telegram(cfg['token'])
         store.recover(); last_prune = 0
-        while True:
+        if ready_event is not None:
+            ready_event.set()
+        while not stop_event.is_set():
             if time.time()-last_prune > 3600:
                 store.prune(cfg['retention']); last_prune = time.time()
             if not process_one(store,translator,tg,cfg):
-                time.sleep(0.5)
+                stop_event.wait(0.2)
 
 
 def main():
-    from dotenv import load_dotenv
-    load_dotenv()
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
     # HTTP client logs may contain token-bearing URLs, so suppress them.
     logging.getLogger('httpx').setLevel(logging.CRITICAL)
     logging.getLogger('httpcore').setLevel(logging.CRITICAL)
     p = argparse.ArgumentParser()
-    p.add_argument('command', choices=['web','worker','set-webhook','status','retry'])
+    p.add_argument('command', nargs='?', default='web', choices=['web','worker','set-webhook','status','retry'])
     p.add_argument('--update-id',type=int)
     args = p.parse_args(); cfg = config()
     if args.command == 'web':
@@ -486,10 +532,12 @@ def main():
         worker(cfg)
     elif args.command == 'set-webhook':
         url = os.getenv('WEBHOOK_URL','')
-        if not url.startswith('https://') or not cfg['token'] or not cfg['secret']:
-            raise SystemExit('设置 HTTPS WEBHOOK_URL、bot token 和 webhook secret')
-        Telegram(cfg['token']).call('setWebhook',{'url':url,'secret_token':cfg['secret'],
-                    'allowed_updates':['message','edited_message'],'max_connections':1})
+        if not url.startswith('https://') or not cfg['token']:
+            raise SystemExit('设置 HTTPS WEBHOOK_URL 和 TELEGRAM_BOT_TOKEN')
+        payload = {'url':url,'allowed_updates':['message','edited_message'],'max_connections':1}
+        if cfg['secret']:
+            payload['secret_token'] = cfg['secret']
+        Telegram(cfg['token']).call('setWebhook',payload)
         print('Webhook 已设置')
     elif args.command == 'status':
         print(json.dumps(Store(cfg['db']).status(),ensure_ascii=False,indent=2))
@@ -501,6 +549,10 @@ def main():
             db.execute("UPDATE jobs SET state='pending',attempts=0,due=0,error='' WHERE update_id=?",(args.update_id,))
         print('已重新排队')
 
+
+# Compatible with the original Railway entrypoint: gunicorn app:app.
+# Creation does not contact external services; processing starts after forking.
+app = create_app()
 
 if __name__ == '__main__':
     main()
